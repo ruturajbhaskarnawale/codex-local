@@ -118,7 +118,7 @@ pub struct Config {
     /// appends one extra argument containing a JSON payload describing the
     /// event.
     ///
-    /// Example `~/.codex/config.toml` snippet:
+    /// Example `~/.codex-local/config.toml` snippet:
     ///
     /// ```toml
     /// notify = ["notify-send", "Codex"]
@@ -231,6 +231,14 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config_types::OtelConfig,
+
+    /// Profile to use for the orchestrator agent (parent thread) in multi-agent mode.
+    /// When set, the orchestrator will use this profile's model and configuration.
+    pub active_orchestrator_profile: Option<String>,
+
+    /// Profiles available for child agents spawned by the orchestrator.
+    /// The orchestrator can select from these profiles when spawning task-specific agents.
+    pub active_agent_profiles: Vec<String>,
 }
 
 impl Config {
@@ -693,7 +701,7 @@ fn apply_toml_override(root: &mut TomlValue, path: &str, value: TomlValue) {
     }
 }
 
-/// Base config deserialized from ~/.codex/config.toml.
+/// Base config deserialized from ~/.codex-local/config.toml.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigToml {
     /// Optional override of model selection.
@@ -817,6 +825,15 @@ pub struct ConfigToml {
 
     /// Tracks whether the Windows onboarding screen has been acknowledged.
     pub windows_wsl_setup_acknowledged: Option<bool>,
+
+    /// Profile to use for the orchestrator agent (parent thread) in multi-agent mode.
+    /// When set, the orchestrator will use this profile's model and configuration.
+    pub orchestrator_profile: Option<String>,
+
+    /// Profiles available for child agents spawned by the orchestrator.
+    /// The orchestrator can select from these profiles when spawning task-specific agents.
+    #[serde(default)]
+    pub agent_profiles: Option<Vec<String>>,
 }
 
 impl From<ConfigToml> for UserSavedConfig {
@@ -957,6 +974,7 @@ pub struct ConfigOverrides {
     pub include_view_image_tool: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
+    pub model_reasoning_effort: Option<codex_protocol::config_types::ReasoningEffort>,
 }
 
 impl Config {
@@ -985,6 +1003,7 @@ impl Config {
             include_view_image_tool,
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
+            model_reasoning_effort: override_model_reasoning_effort,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1076,17 +1095,24 @@ impl Config {
         let openai_model_info = get_model_info(&model_family);
         let model_context_window = cfg
             .model_context_window
+            .or(config_profile.model_context_window)
             .or_else(|| openai_model_info.as_ref().map(|info| info.context_window));
-        let model_max_output_tokens = cfg.model_max_output_tokens.or_else(|| {
-            openai_model_info
-                .as_ref()
-                .map(|info| info.max_output_tokens)
-        });
-        let model_auto_compact_token_limit = cfg.model_auto_compact_token_limit.or_else(|| {
-            openai_model_info
-                .as_ref()
-                .and_then(|info| info.auto_compact_token_limit)
-        });
+        let model_max_output_tokens = cfg
+            .model_max_output_tokens
+            .or(config_profile.model_max_output_tokens)
+            .or_else(|| {
+                openai_model_info
+                    .as_ref()
+                    .map(|info| info.max_output_tokens)
+            });
+        let model_auto_compact_token_limit = cfg
+            .model_auto_compact_token_limit
+            .or(config_profile.model_auto_compact_token_limit)
+            .or_else(|| {
+                openai_model_info
+                    .as_ref()
+                    .and_then(|info| info.auto_compact_token_limit)
+            });
 
         // Load base instructions override from a file if specified. If the
         // path is relative, resolve it against the effective cwd so the
@@ -1152,8 +1178,8 @@ impl Config {
                 .show_raw_agent_reasoning
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
-            model_reasoning_effort: config_profile
-                .model_reasoning_effort
+            model_reasoning_effort: override_model_reasoning_effort
+                .or(config_profile.model_reasoning_effort)
                 .or(cfg.model_reasoning_effort),
             model_reasoning_summary: config_profile
                 .model_reasoning_summary
@@ -1198,6 +1224,8 @@ impl Config {
                     exporter,
                 }
             },
+            active_orchestrator_profile: cfg.orchestrator_profile,
+            active_agent_profiles: cfg.agent_profiles.unwrap_or_default(),
         };
         Ok(config)
     }
@@ -1272,7 +1300,7 @@ fn default_review_model() -> String {
 
 /// Returns the path to the Codex configuration directory, which can be
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
-/// `~/.codex`.
+/// `~/.codex-local`.
 ///
 /// - If `CODEX_HOME` is set, the value will be canonicalized and this
 ///   function will Err if the path does not exist.
@@ -1293,7 +1321,7 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
             "Could not find home directory",
         )
     })?;
-    p.push(".codex");
+    p.push(".codex-local");
     Ok(p)
 }
 
@@ -2125,6 +2153,8 @@ model_verbosity = "high"
                 disable_paste_burst: false,
                 tui_notifications: Default::default(),
                 otel: OtelConfig::default(),
+                active_orchestrator_profile: None,
+                active_agent_profiles: Vec::new(),
             },
             o3_profile_config
         );
@@ -2188,6 +2218,8 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             otel: OtelConfig::default(),
+            active_orchestrator_profile: None,
+            active_agent_profiles: Vec::new(),
         };
 
         assert_eq!(expected_gpt3_profile_config, gpt3_profile_config);
@@ -2266,6 +2298,8 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             otel: OtelConfig::default(),
+            active_orchestrator_profile: None,
+            active_agent_profiles: Vec::new(),
         };
 
         assert_eq!(expected_zdr_profile_config, zdr_profile_config);
@@ -2330,6 +2364,8 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             otel: OtelConfig::default(),
+            active_orchestrator_profile: None,
+            active_agent_profiles: Vec::new(),
         };
 
         assert_eq!(expected_gpt5_profile_config, gpt5_profile_config);

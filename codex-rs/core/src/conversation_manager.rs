@@ -6,6 +6,7 @@ use crate::codex::INITIAL_SUBMIT_ID;
 use crate::codex::compact::content_items_to_text;
 use crate::codex::compact::is_session_prefix_message;
 use crate::codex_conversation::CodexConversation;
+use crate::child_agent_bridge::ChildAgentBridge;
 use crate::config::Config;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
@@ -35,17 +36,34 @@ pub struct NewConversation {
 /// maintaining them in memory.
 pub struct ConversationManager {
     conversations: Arc<RwLock<HashMap<ConversationId, Arc<CodexConversation>>>>,
+    child_agent_bridges: Arc<RwLock<HashMap<ConversationId, Arc<ChildAgentBridge>>>>,
     auth_manager: Arc<AuthManager>,
     session_source: SessionSource,
+    self_arc: tokio::sync::OnceCell<Arc<Self>>,
 }
 
 impl ConversationManager {
     pub fn new(auth_manager: Arc<AuthManager>, session_source: SessionSource) -> Self {
         Self {
             conversations: Arc::new(RwLock::new(HashMap::new())),
+            child_agent_bridges: Arc::new(RwLock::new(HashMap::new())),
             auth_manager,
             session_source,
+            self_arc: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Initialize the self-reference. Must be called exactly once after wrapping in Arc.
+    pub fn init_self_ref(self: &Arc<Self>) {
+        let _ = self.self_arc.set(Arc::clone(self));
+    }
+
+    fn get_self_arc(&self) -> CodexResult<Arc<Self>> {
+        self.self_arc.get().cloned().ok_or_else(|| {
+            CodexErr::Fatal(
+                "ConversationManager::init_self_ref must be called after creation".to_string(),
+            )
+        })
     }
 
     /// Construct with a dummy AuthManager containing the provided CodexAuth.
@@ -67,6 +85,7 @@ impl ConversationManager {
         config: Config,
         auth_manager: Arc<AuthManager>,
     ) -> CodexResult<NewConversation> {
+        let self_arc = self.get_self_arc()?;
         let CodexSpawnOk {
             codex,
             conversation_id,
@@ -75,6 +94,7 @@ impl ConversationManager {
             auth_manager,
             InitialHistory::New,
             self.session_source,
+            self_arc,
         )
         .await?;
         self.finalize_spawn(codex, conversation_id).await
@@ -129,11 +149,19 @@ impl ConversationManager {
         rollout_path: PathBuf,
         auth_manager: Arc<AuthManager>,
     ) -> CodexResult<NewConversation> {
+        let self_arc = self.get_self_arc()?;
         let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
         let CodexSpawnOk {
             codex,
             conversation_id,
-        } = Codex::spawn(config, auth_manager, initial_history, self.session_source).await?;
+        } = Codex::spawn(
+            config,
+            auth_manager,
+            initial_history,
+            self.session_source,
+            self_arc,
+        )
+        .await?;
         self.finalize_spawn(codex, conversation_id).await
     }
 
@@ -145,7 +173,14 @@ impl ConversationManager {
         &self,
         conversation_id: &ConversationId,
     ) -> Option<Arc<CodexConversation>> {
-        self.conversations.write().await.remove(conversation_id)
+        let conversation = self
+            .conversations
+            .write()
+            .await
+            .remove(conversation_id);
+        let mut bridges = self.child_agent_bridges.write().await;
+        bridges.remove(conversation_id);
+        conversation
     }
 
     /// Fork an existing conversation by taking messages up to the given position
@@ -164,12 +199,42 @@ impl ConversationManager {
 
         // Spawn a new conversation with the computed initial history.
         let auth_manager = self.auth_manager.clone();
+        let self_arc = self.get_self_arc()?;
         let CodexSpawnOk {
             codex,
             conversation_id,
-        } = Codex::spawn(config, auth_manager, history, self.session_source).await?;
+        } = Codex::spawn(config, auth_manager, history, self.session_source, self_arc).await?;
 
         self.finalize_spawn(codex, conversation_id).await
+    }
+
+    pub async fn register_child_agent_bridge(
+        &self,
+        bridge: Arc<ChildAgentBridge>,
+    ) -> anyhow::Result<()> {
+        let mut map = self.child_agent_bridges.write().await;
+        let id = bridge.conversation_id;
+        if map.contains_key(&id) {
+            anyhow::bail!("child agent bridge already registered for {id}");
+        }
+        map.insert(id, bridge);
+        Ok(())
+    }
+
+    pub async fn remove_child_agent_bridge(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Option<Arc<ChildAgentBridge>> {
+        let mut map = self.child_agent_bridges.write().await;
+        map.remove(conversation_id)
+    }
+
+    pub async fn get_child_agent_bridge(
+        &self,
+        conversation_id: &ConversationId,
+    ) -> Option<Arc<ChildAgentBridge>> {
+        let map = self.child_agent_bridges.read().await;
+        map.get(conversation_id).cloned()
     }
 }
 

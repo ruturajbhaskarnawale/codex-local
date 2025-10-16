@@ -56,6 +56,12 @@ pub enum Op {
     /// This server sends [`EventMsg::TurnAborted`] in response.
     Interrupt,
 
+    /// Abort a specific child agent.
+    InterruptAgent {
+        /// Identifier of the child agent to interrupt.
+        agent_id: String,
+    },
+
     /// Input from the user
     UserInput {
         /// User input items, see `InputItem`
@@ -408,7 +414,7 @@ pub enum InputItem {
 }
 
 /// Event Queue Entry - events from agent
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct Event {
     /// Submission `id` that this event is correlated with.
     pub id: String,
@@ -509,6 +515,21 @@ pub enum EventMsg {
     ListCustomPromptsResponse(ListCustomPromptsResponseEvent),
 
     PlanUpdate(UpdatePlanArgs),
+
+    /// Notification that a child agent has been spawned.
+    AgentSpawned(AgentSpawnedEvent),
+
+    /// Event emitted by a spawned agent, tagged with its identifier.
+    AgentEvent(AgentEvent),
+
+    /// Progress update from a specific agent.
+    AgentProgress(AgentProgressEvent),
+
+    /// Notification that an agent has completed its task.
+    AgentCompleted(AgentCompletedEvent),
+
+    /// UI hint that focus has switched to a different agent.
+    AgentSwitched(AgentSwitchedEvent),
 
     TurnAborted(TurnAbortedEvent),
 
@@ -1349,6 +1370,58 @@ pub struct Chunk {
     pub orig_index: u32,
     pub deleted_lines: Vec<String>,
     pub inserted_lines: Vec<String>,
+}
+
+/// Notification that a child agent has been spawned by the orchestrator.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct AgentSpawnedEvent {
+    /// Unique identifier for this agent.
+    pub agent_id: String,
+    /// Optional parent agent ID (None for the main orchestrator thread).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Profile name used for this agent, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Human-readable purpose/description of this agent's task.
+    pub purpose: String,
+}
+
+/// Event emitted by a child agent.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct AgentEvent {
+    /// Identifier for the agent that produced this event.
+    pub agent_id: String,
+    /// Underlying event from the agent.
+    #[ts(type = "Event")]
+    pub event: Box<Event>,
+}
+
+/// Progress update from a specific agent.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct AgentProgressEvent {
+    /// Identifier for the agent reporting progress.
+    pub agent_id: String,
+    /// Progress message.
+    pub message: String,
+}
+
+/// Notification that an agent has completed its task.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct AgentCompletedEvent {
+    /// Identifier for the agent that completed.
+    pub agent_id: String,
+    /// Whether the task completed successfully.
+    pub success: bool,
+    /// Summary of the agent's work.
+    pub summary: String,
+}
+
+/// UI hint that focus has switched to a different agent.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct AgentSwitchedEvent {
+    /// Identifier for the agent now in focus.
+    pub agent_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]

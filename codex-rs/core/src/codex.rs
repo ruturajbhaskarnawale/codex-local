@@ -1,10 +1,13 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use crate::AuthManager;
+use crate::CodexConversation;
+use crate::ConversationManager;
 use crate::client_common::REVIEW_PROMPT;
 use crate::event_mapping::map_response_item_to_event_messages;
 use crate::function_tool::FunctionCallError;
@@ -120,6 +123,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::TaskCompleteEvent;
 
 pub mod compact;
 use self::compact::build_compacted_history;
@@ -151,6 +155,7 @@ impl Codex {
         auth_manager: Arc<AuthManager>,
         conversation_history: InitialHistory,
         session_source: SessionSource,
+        conversation_manager: Arc<ConversationManager>,
     ) -> CodexResult<CodexSpawnOk> {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -180,6 +185,7 @@ impl Codex {
             tx_event.clone(),
             conversation_history,
             session_source,
+            conversation_manager,
         )
         .await
         .map_err(|e| {
@@ -244,6 +250,7 @@ pub(crate) struct Session {
     state: Mutex<SessionState>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
+    child_agents: Mutex<HashMap<String, Arc<CodexConversation>>>,
     next_internal_sub_id: AtomicU64,
 }
 
@@ -315,6 +322,7 @@ impl Session {
         tx_event: Sender<Event>,
         initial_history: InitialHistory,
         session_source: SessionSource,
+        conversation_manager: Arc<ConversationManager>,
     ) -> anyhow::Result<(Arc<Self>, TurnContext)> {
         let ConfigureSession {
             provider,
@@ -452,6 +460,9 @@ impl Session {
                 use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
                 include_view_image_tool: config.include_view_image_tool,
                 experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                include_spawn_agent_tool: config.active_orchestrator_profile.is_some()
+                    && !config.active_agent_profiles.is_empty(),
+                include_return_progress_tool: !config.active_agent_profiles.is_empty(),
             }),
             user_instructions,
             base_instructions,
@@ -475,6 +486,8 @@ impl Session {
                 turn_context.cwd.clone(),
                 config.codex_linux_sandbox_exe.clone(),
             )),
+            conversation_manager,
+            config: config.clone(),
         };
 
         let sess = Arc::new(Session {
@@ -483,6 +496,7 @@ impl Session {
             state: Mutex::new(state),
             active_turn: Mutex::new(None),
             services,
+            child_agents: Mutex::new(HashMap::new()),
             next_internal_sub_id: AtomicU64::new(0),
         });
 
@@ -1087,10 +1101,16 @@ impl Session {
 
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
+        self.cancel_all_child_agents().await;
         self.abort_all_tasks(TurnAbortReason::Interrupted).await;
     }
 
+    pub(crate) fn conversation_id(&self) -> ConversationId {
+        self.conversation_id
+    }
+
     fn interrupt_task_sync(&self) {
+        self.clear_child_agents_sync();
         if let Ok(mut active) = self.active_turn.try_lock()
             && let Some(at) = active.as_mut()
         {
@@ -1114,6 +1134,89 @@ impl Session {
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
     }
+
+    pub async fn register_child_agent(
+        self: &Arc<Self>,
+        agent_id: String,
+        conversation: Arc<CodexConversation>,
+    ) {
+        let mut agents = self.child_agents.lock().await;
+        agents.insert(agent_id, conversation);
+    }
+
+    pub async fn unregister_child_agent(self: &Arc<Self>, agent_id: &str) {
+        let should_emit_completion = {
+            let mut agents = self.child_agents.lock().await;
+            agents.remove(agent_id);
+            agents.is_empty()
+        };
+
+        if should_emit_completion
+            && let Some((sub_id, last_agent_message)) = self.take_pending_task_complete().await
+        {
+            self.emit_task_complete(sub_id, last_agent_message).await;
+        }
+    }
+
+    pub async fn cancel_child_agent(self: &Arc<Self>, agent_id: &str) -> bool {
+        let conversation = {
+            let agents = self.child_agents.lock().await;
+            agents.get(agent_id).cloned()
+        };
+        if let Some(conversation) = conversation {
+            let _ = conversation.submit(Op::Interrupt).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn cancel_all_child_agents(self: &Arc<Self>) {
+        let conversations: Vec<Arc<CodexConversation>> = {
+            let agents = self.child_agents.lock().await;
+            agents.values().cloned().collect()
+        };
+        for conversation in conversations {
+            let _ = conversation.submit(Op::Interrupt).await;
+        }
+    }
+
+    fn clear_child_agents_sync(&self) {
+        if let Ok(mut agents) = self.child_agents.try_lock() {
+            agents.clear();
+        }
+    }
+
+    pub(crate) async fn has_child_agents(&self) -> bool {
+        let agents = self.child_agents.lock().await;
+        !agents.is_empty()
+    }
+
+    pub(crate) async fn set_pending_task_complete(
+        &self,
+        sub_id: String,
+        last_agent_message: Option<String>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.set_pending_task_complete(sub_id, last_agent_message);
+    }
+
+    async fn take_pending_task_complete(&self) -> Option<(String, Option<String>)> {
+        let mut state = self.state.lock().await;
+        state.take_pending_task_complete()
+    }
+
+    pub(crate) async fn emit_task_complete(
+        &self,
+        sub_id: String,
+        last_agent_message: Option<String>,
+    ) {
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }),
+        };
+        self.send_event(event).await;
+    }
 }
 
 impl Drop for Session {
@@ -1136,6 +1239,11 @@ async fn submission_loop(
         match sub.op {
             Op::Interrupt => {
                 sess.interrupt_task().await;
+            }
+            Op::InterruptAgent { agent_id } => {
+                if !sess.cancel_child_agent(&agent_id).await {
+                    warn!(%agent_id, "requested interrupt for unknown child agent");
+                }
             }
             Op::OverrideTurnContext {
                 cwd,
@@ -1201,6 +1309,9 @@ async fn submission_loop(
                     use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
                     include_view_image_tool: config.include_view_image_tool,
                     experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                    include_spawn_agent_tool: config.active_orchestrator_profile.is_some()
+                        && !config.active_agent_profiles.is_empty(),
+                    include_return_progress_tool: !config.active_agent_profiles.is_empty(),
                 });
 
                 let new_turn_context = TurnContext {
@@ -1305,6 +1416,9 @@ async fn submission_loop(
                             include_view_image_tool: config.include_view_image_tool,
                             experimental_unified_exec_tool: config
                                 .use_experimental_unified_exec_tool,
+                            include_spawn_agent_tool: config.active_orchestrator_profile.is_some()
+                                && !config.active_agent_profiles.is_empty(),
+                            include_return_progress_tool: !config.active_agent_profiles.is_empty(),
                         }),
                         user_instructions: turn_context.user_instructions.clone(),
                         base_instructions: turn_context.base_instructions.clone(),
@@ -1544,6 +1658,8 @@ async fn spawn_review_thread(
         use_streamable_shell_tool: false,
         include_view_image_tool: false,
         experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+        include_spawn_agent_tool: false, // Review threads don't need orchestrator
+        include_return_progress_tool: false,
     });
 
     let base_instructions = REVIEW_PROMPT.to_string();
@@ -1662,6 +1778,11 @@ pub(crate) async fn run_task(
     }
 
     let mut last_agent_message: Option<String> = None;
+    // Track whether the previous iteration replied to any tool calls. If the
+    // next turn yields no content, we can gently nudge the model to use the
+    // tool output to finish the task instead of stopping early.
+    let mut had_tool_responses_prev_iteration = false;
+    let mut nudged_after_empty_turn = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -1864,6 +1985,29 @@ pub(crate) async fn run_task(
                 auto_compact_recently_attempted = false;
 
                 if responses.is_empty() {
+                    // If we just sent tool outputs in the prior iteration and the
+                    // model produced no content in response, nudge it once to
+                    // continue using the tool results. This helps recover cases
+                    // where the model stops after a tool call instead of
+                    // returning an answer.
+                    if last_agent_message.is_none()
+                        && had_tool_responses_prev_iteration
+                        && !nudged_after_empty_turn
+                        && !is_review_mode
+                    {
+                        let prompt = "Use the previous tool results to finish the task. Summarize the outcome clearly and provide the final answer or next steps.".to_string();
+                        let user_msg = ResponseItem::Message {
+                            id: None,
+                            role: "user".to_string(),
+                            content: vec![ContentItem::InputText { text: prompt }],
+                        };
+                        sess.record_conversation_items(&[user_msg]).await;
+                        nudged_after_empty_turn = true;
+                        // Try one more turn
+                        // Reset the flag so we don't consider this as a tool-output turn
+                        had_tool_responses_prev_iteration = false;
+                        continue;
+                    }
                     last_agent_message = get_last_assistant_message_from_turn(
                         &items_to_record_in_conversation_history,
                     );
@@ -1875,6 +2019,8 @@ pub(crate) async fn run_task(
                         });
                     break;
                 }
+                // Remember whether we emitted tool results this turn to assist recovery next turn.
+                had_tool_responses_prev_iteration = !responses.is_empty();
                 continue;
             }
             Err(e) => {
@@ -2754,6 +2900,9 @@ mod tests {
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            include_spawn_agent_tool: config.active_orchestrator_profile.is_some()
+                && !config.active_agent_profiles.is_empty(),
+            include_return_progress_tool: !config.active_agent_profiles.is_empty(),
         });
         let turn_context = TurnContext {
             client,
@@ -2780,6 +2929,12 @@ mod tests {
                 turn_context.cwd.clone(),
                 None,
             )),
+            conversation_manager: ConversationManager::new(
+                AuthManager::new(codex_home.path().to_path_buf(), true).into(),
+                SessionSource::default(),
+            )
+            .into(),
+            config: config.clone(),
         };
         let session = Session {
             conversation_id,
@@ -2787,6 +2942,7 @@ mod tests {
             state: Mutex::new(SessionState::new()),
             active_turn: Mutex::new(None),
             services,
+            child_agents: Mutex::new(HashMap::new()),
             next_internal_sub_id: AtomicU64::new(0),
         };
         (session, turn_context)
@@ -2827,6 +2983,9 @@ mod tests {
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            include_spawn_agent_tool: config.active_orchestrator_profile.is_some()
+                && !config.active_agent_profiles.is_empty(),
+            include_return_progress_tool: !config.active_agent_profiles.is_empty(),
         });
         let turn_context = Arc::new(TurnContext {
             client,
@@ -2853,6 +3012,12 @@ mod tests {
                 config.cwd.clone(),
                 None,
             )),
+            conversation_manager: ConversationManager::new(
+                AuthManager::new(codex_home.path().to_path_buf(), true).into(),
+                SessionSource::default(),
+            )
+            .into(),
+            config: config.clone(),
         };
         let session = Arc::new(Session {
             conversation_id,
@@ -2860,6 +3025,7 @@ mod tests {
             state: Mutex::new(SessionState::new()),
             active_turn: Mutex::new(None),
             services,
+            child_agents: Mutex::new(HashMap::new()),
             next_internal_sub_id: AtomicU64::new(0),
         });
         (session, turn_context, rx_event)

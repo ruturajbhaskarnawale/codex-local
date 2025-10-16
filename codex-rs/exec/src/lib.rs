@@ -181,6 +181,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         include_view_image_tool: None,
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
+        model_reasoning_effort: None,
     };
     // Parse `-c` overrides.
     let mut config_overrides = config_overrides;
@@ -247,7 +248,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     }
 
     let auth_manager = AuthManager::shared(config.codex_home.clone(), true);
-    let conversation_manager = ConversationManager::new(auth_manager.clone(), SessionSource::Exec);
+    let conversation_manager = std::sync::Arc::new(ConversationManager::new(
+        auth_manager.clone(),
+        SessionSource::Exec,
+    ));
+    conversation_manager.init_self_ref();
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
     let NewConversation {

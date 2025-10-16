@@ -7,6 +7,7 @@ use codex_core::config::Config;
 use codex_core::config_types::Notifications;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::local_git_branches;
+use codex_core::protocol::AgentEvent;
 use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningDeltaEvent;
@@ -53,6 +54,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 use tokio::sync::mpsc::UnboundedSender;
@@ -64,6 +70,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
+use crate::bottom_pane::FooterSubagentInfo;
 use crate::bottom_pane::InputResult;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
@@ -77,9 +84,11 @@ use crate::exec_cell::ExecCell;
 use crate::exec_cell::new_active_exec_command;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
+use crate::history_cell::AgentDecoratedCell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
+use crate::history_cell::PlainHistoryCell;
 use crate::markdown::append_markdown;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
@@ -207,6 +216,341 @@ pub(crate) fn get_limits_duration(windows_minutes: u64) -> String {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct AgentMeta {
+    profile: Option<String>,
+    purpose: String,
+    // None = in progress, Some(true) = success, Some(false) = failed
+    status: Option<bool>,
+    last_summary: Option<String>,
+    transcript: Vec<String>,
+    context_percent: Option<u8>,
+}
+
+struct SubAgentState {
+    color: Color,
+    _active_cell: Option<Box<dyn HistoryCell>>,
+    message_buffer: String,
+    reasoning_buffer: String,
+    full_reasoning_buffer: String,
+    context_percent: Option<u8>,
+    last_status: Option<String>,
+}
+
+impl SubAgentState {
+    fn new(color: Color) -> Self {
+        Self {
+            color,
+            _active_cell: None,
+            message_buffer: String::new(),
+            reasoning_buffer: String::new(),
+            full_reasoning_buffer: String::new(),
+            context_percent: None,
+            last_status: None,
+        }
+    }
+
+    fn color(&self) -> Color {
+        self.color
+    }
+
+    fn footer_status(&self) -> Option<String> {
+        self.last_status.clone()
+    }
+
+    fn context_percent(&self) -> Option<u8> {
+        self.context_percent
+    }
+
+    fn set_context_percent(&mut self, percent: u8) {
+        self.context_percent = Some(percent);
+    }
+
+    fn handle_event(&mut self, event: Event, config: &Config) -> Vec<Box<dyn HistoryCell>> {
+        let mut outputs: Vec<Box<dyn HistoryCell>> = Vec::new();
+        match event.msg {
+            EventMsg::TaskStarted(_) => {
+                self.record_status("started");
+            }
+            EventMsg::AgentMessageDelta(delta) => {
+                self.message_buffer.push_str(&delta.delta);
+            }
+            EventMsg::AgentMessage(ev) => {
+                // For subagents, avoid spam in the transcript while still
+                // keeping status fresh. Only record the status here; final
+                // message will be rendered via AgentCompleted summary.
+                self.message_buffer = ev.message;
+                self.record_status("responded");
+                self.message_buffer.clear();
+            }
+            EventMsg::AgentReasoningDelta(delta) => {
+                self.reasoning_buffer.push_str(&delta.delta);
+            }
+            EventMsg::AgentReasoning(ev) => {
+                if !ev.text.trim().is_empty() {
+                    self.reasoning_buffer.push_str(&ev.text);
+                }
+                // Collapse reasoning blocks for subagents to keep the
+                // transcript clean; surface activity via footer status only.
+                self.reasoning_buffer.clear();
+                self.full_reasoning_buffer.clear();
+                self.record_status("reasoning");
+            }
+            EventMsg::AgentReasoningRawContentDelta(delta) => {
+                self.reasoning_buffer.push_str(&delta.delta);
+            }
+            EventMsg::AgentReasoningRawContent(ev) => {
+                if !ev.text.trim().is_empty() {
+                    self.reasoning_buffer.push_str(&ev.text);
+                }
+                // Do not render raw reasoning for subagents; keep footer updated.
+                self.reasoning_buffer.clear();
+                self.full_reasoning_buffer.clear();
+                self.record_status("reasoning");
+            }
+            EventMsg::AgentReasoningSectionBreak(_) => {
+                self.reasoning_section_break();
+            }
+            EventMsg::ExecCommandBegin(ev) => {
+                // Suppress per-call exec rendering for subagents; keep a concise status
+                let snippet = join_command_preview(&ev.command);
+                self.record_status(&format!("exec {snippet}"));
+            }
+            EventMsg::ExecCommandEnd(ev) => {
+                // Suppress per-call exec rendering for subagents; update status
+                self.record_status(&format!("exec exit {}", ev.exit_code));
+            }
+            EventMsg::McpToolCallBegin(ev) => {
+                // Avoid verbose tool call content for subagents
+                self.record_status(&format!(
+                    "tool {}.{}",
+                    ev.invocation.server, ev.invocation.tool
+                ));
+            }
+            EventMsg::McpToolCallEnd(ev) => {
+                // Only reflect final status
+                self.record_status(&format!(
+                    "tool {}.{} {}",
+                    ev.invocation.server,
+                    ev.invocation.tool,
+                    if ev.is_success() { "ok" } else { "failed" }
+                ));
+            }
+            EventMsg::ViewImageToolCall(_ev) => {
+                // Skip image/tool visualization for subagents; update status only
+                self.record_status("viewed image");
+            }
+            EventMsg::WebSearchBegin(_) => {
+                self.record_status("searching…");
+            }
+            EventMsg::WebSearchEnd(ev) => {
+                // Keep a short status only
+                self.record_status(&format!("search \"{}\"", ev.query));
+            }
+            EventMsg::TokenCount(ev) => {
+                if let Some(info) = ev.info
+                    && let Some(ctx) = info.model_context_window
+                {
+                    let pct = info
+                        .last_token_usage
+                        .percent_of_context_window_remaining(ctx);
+                    self.set_context_percent(pct);
+                }
+            }
+            EventMsg::StreamError(ev) => {
+                self.record_status(&format!("stream error: {}", ev.message));
+            }
+            EventMsg::BackgroundEvent(ev) => {
+                self.record_status(&ev.message);
+            }
+            EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
+                self.flush_message(last_agent_message, config, &mut outputs);
+                self.flush_reasoning(config, &mut outputs);
+                self.flush_active_cell(&mut outputs);
+            }
+            EventMsg::Error(err) => {
+                outputs.push(
+                    self.decorate_body(Self::boxed(history_cell::new_error_event(
+                        err.message.clone(),
+                    ))),
+                );
+                self.record_status(&format!("error: {}", err.message));
+            }
+            EventMsg::PlanUpdate(_) | EventMsg::TurnDiff(_) | EventMsg::ConversationPath(_) => {}
+            EventMsg::ExecCommandOutputDelta(_) => {}
+            EventMsg::TurnAborted(ev) => {
+                self.record_status(&format!("aborted ({:?})", ev.reason));
+                self.flush_message(None, config, &mut outputs);
+                self.flush_reasoning(config, &mut outputs);
+                self.flush_active_cell(&mut outputs);
+            }
+            _ => {}
+        }
+        outputs
+    }
+
+    fn completion_cells(
+        &mut self,
+        success: bool,
+        summary: String,
+        config: &Config,
+    ) -> Vec<Box<dyn HistoryCell>> {
+        let mut outputs = Vec::new();
+        self.flush_message(None, config, &mut outputs);
+        self.flush_reasoning(config, &mut outputs);
+        self.flush_active_cell(&mut outputs);
+
+        let status_line: Line<'static> = if success {
+            "✓ completed".green().bold().into()
+        } else {
+            "✗ failed".red().bold().into()
+        };
+
+        let mut lines: Vec<Line<'static>> = vec![status_line];
+        let trimmed_summary = summary.trim().to_owned();
+        if !trimmed_summary.is_empty() {
+            append_markdown(&trimmed_summary, None, &mut lines, config);
+        }
+        if let Some(pct) = self.context_percent {
+            lines.push(format!("context remaining: {pct}%").dim().into());
+        }
+        let footer_cell = PlainHistoryCell::new(lines);
+        outputs.push(self.decorate_footer(Self::boxed(footer_cell)));
+
+        self.last_status = Some(summary);
+        outputs
+    }
+
+    fn record_status(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let first_line = trimmed.lines().next().unwrap_or(trimmed);
+        let mut shortened: String = first_line.chars().take(80).collect();
+        if first_line.chars().count() > 80 {
+            shortened.push('…');
+        }
+        self.last_status = Some(shortened);
+    }
+
+    fn decorate_with(
+        &self,
+        cell: Box<dyn HistoryCell>,
+        first_prefix: Line<'static>,
+        other_prefix: Line<'static>,
+    ) -> Box<dyn HistoryCell> {
+        Box::new(AgentDecoratedCell::new(cell, first_prefix, other_prefix))
+    }
+
+    fn boxed<T: HistoryCell + 'static>(cell: T) -> Box<dyn HistoryCell> {
+        Box::new(cell)
+    }
+
+    fn decorate_header(&self, cell: Box<dyn HistoryCell>) -> Box<dyn HistoryCell> {
+        // Header gets a clean, subtle treatment with the agent color
+        let header_bullet = Span::styled("▪ ", Style::default().fg(self.color));
+        let header_prefix = Line::from(vec![header_bullet]);
+        let body_prefix = Line::from(vec![Span::styled(
+            "  ",
+            Style::default().fg(self.color).dim(),
+        )]);
+        self.decorate_with(cell, header_prefix, body_prefix)
+    }
+
+    fn decorate_body(&self, cell: Box<dyn HistoryCell>) -> Box<dyn HistoryCell> {
+        // Create a clean card-like layout with subtle indentation
+        let indent = Span::styled("   ", Style::default().fg(self.color));
+        let prefix = Line::from(vec![indent]);
+        self.decorate_with(cell, prefix.clone(), prefix)
+    }
+
+    fn decorate_footer(&self, cell: Box<dyn HistoryCell>) -> Box<dyn HistoryCell> {
+        // Footer gets minimal treatment
+        let prefix = Line::from(vec![Span::styled(
+            "   ",
+            Style::default().fg(self.color).dim(),
+        )]);
+        self.decorate_with(cell, prefix.clone(), prefix)
+    }
+
+    fn flush_message(
+        &mut self,
+        message: Option<String>,
+        config: &Config,
+        outputs: &mut Vec<Box<dyn HistoryCell>>,
+    ) {
+        if let Some(msg) = message {
+            self.message_buffer = msg;
+        }
+        let trimmed = self.message_buffer.trim();
+        if trimmed.is_empty() {
+            self.message_buffer.clear();
+            return;
+        }
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        append_markdown(trimmed, None, &mut lines, config);
+        let cell = AgentMessageCell::new(lines, true);
+        outputs.push(self.decorate_body(Self::boxed(cell)));
+        let status = trimmed.to_string();
+        self.record_status(&status);
+        self.message_buffer.clear();
+    }
+
+    fn flush_reasoning(&mut self, config: &Config, outputs: &mut Vec<Box<dyn HistoryCell>>) {
+        if self.reasoning_buffer.trim().is_empty() && self.full_reasoning_buffer.trim().is_empty() {
+            self.reasoning_buffer.clear();
+            self.full_reasoning_buffer.clear();
+            return;
+        }
+
+        if !self.full_reasoning_buffer.is_empty() && !self.reasoning_buffer.is_empty() {
+            self.full_reasoning_buffer.push_str("\n\n");
+        }
+        self.full_reasoning_buffer
+            .push_str(self.reasoning_buffer.trim_end());
+
+        let summary = self.full_reasoning_buffer.trim();
+        if !summary.is_empty() {
+            let cell = history_cell::new_reasoning_summary_block(summary.to_string(), config);
+            // Don't decorate reasoning blocks - let them render with same style as main agent
+            outputs.push(cell);
+            self.record_status("reasoned");
+        }
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+    }
+
+    fn reasoning_section_break(&mut self) {
+        // Skip if reasoning buffer is empty or contains only whitespace
+        if self.reasoning_buffer.trim().is_empty() {
+            self.reasoning_buffer.clear();
+            return;
+        }
+        if !self.full_reasoning_buffer.is_empty() {
+            self.full_reasoning_buffer.push_str("\n\n");
+        }
+        self.full_reasoning_buffer
+            .push_str(self.reasoning_buffer.trim_end());
+        self.reasoning_buffer.clear();
+    }
+
+    fn flush_active_cell(&mut self, _outputs: &mut [Box<dyn HistoryCell>]) {
+        // This method intentionally does nothing for SubAgentState.
+        // SubAgentState cells are not flushed to outputs; they remain internal
+        // until completion_cells() is called.
+    }
+}
+
+fn join_command_preview(parts: &[String]) -> String {
+    let joined =
+        shlex::try_join(parts.iter().map(String::as_str)).unwrap_or_else(|_| parts.join(" "));
+    let mut truncated: String = joined.chars().take(60).collect();
+    if joined.chars().count() > 60 {
+        truncated.push('…');
+    }
+    truncated
+}
 /// Common initialization parameters shared by all `ChatWidget` constructors.
 pub(crate) struct ChatWidgetInit {
     pub(crate) config: Config,
@@ -253,6 +597,8 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    // Whether we've auto-scheduled a continuation turn after subagents finish
+    auto_continuation_scheduled: bool,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     // Simple review mode flag; used to adjust layout and banners.
@@ -269,6 +615,10 @@ pub(crate) struct ChatWidget {
     session_input_tokens: u64,
     session_output_tokens: u64,
     current_turn_input_tokens: u64,
+    // Tracked spawned agents for overview rendering
+    agents: HashMap<String, AgentMeta>,
+    subagent_states: HashMap<String, SubAgentState>,
+    active_subagent: Option<String>,
 }
 
 struct UserMessage {
@@ -318,6 +668,48 @@ impl ChatWidget {
         }
         self.current_status_header = header.clone();
         self.bottom_pane.update_status_header(header);
+    }
+
+    fn refresh_footer_subagent(&mut self) {
+        let info = self.active_subagent.as_ref().and_then(|agent_id| {
+            let state = self.subagent_states.get(agent_id)?;
+
+            // Find the agent number for display
+            let agent_ids: Vec<String> = self.agents.keys().cloned().collect();
+            let agent_number = agent_ids
+                .iter()
+                .position(|id| id == agent_id)
+                .map(|i| i + 1);
+            let total_agents = agent_ids.len();
+
+            let label = self
+                .agents
+                .get(agent_id)
+                .and_then(|meta| {
+                    let purpose = meta.purpose.trim();
+                    if purpose.is_empty() {
+                        None
+                    } else {
+                        Some(purpose.to_string())
+                    }
+                })
+                .unwrap_or_else(|| agent_id.clone());
+
+            // Add agent number to label if available
+            let label_with_number = if let Some(num) = agent_number {
+                format!("{num}. {label} (Ctrl+{num})")
+            } else {
+                format!("{label} ({total_agents})")
+            };
+
+            Some(FooterSubagentInfo {
+                label: label_with_number,
+                status: state.footer_status(),
+                context_percent: state.context_percent(),
+                color: state.color(),
+            })
+        });
+        self.bottom_pane.set_active_subagent(info);
     }
 
     // --- Small event handlers ---
@@ -379,7 +771,8 @@ impl ChatWidget {
     fn on_agent_reasoning_final(&mut self) {
         // At the end of a reasoning block, record transcript-only content.
         self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
-        if !self.full_reasoning_buffer.is_empty() {
+        // Only create reasoning cell if there's actual content (not just whitespace)
+        if !self.full_reasoning_buffer.trim().is_empty() {
             let cell = history_cell::new_reasoning_summary_block(
                 self.full_reasoning_buffer.clone(),
                 &self.config,
@@ -393,6 +786,12 @@ impl ChatWidget {
 
     fn on_reasoning_section_break(&mut self) {
         // Start a new reasoning block for header extraction and accumulate transcript.
+        // Skip if reasoning buffer is empty or contains only whitespace
+        if self.reasoning_buffer.trim().is_empty() {
+            self.reasoning_buffer.clear();
+            return;
+        }
+
         self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
         self.full_reasoning_buffer.push_str("\n\n");
         self.reasoning_buffer.clear();
@@ -407,6 +806,8 @@ impl ChatWidget {
         self.set_status_header(String::from("Working"));
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
+        // Reset auto-continuation scheduling at the start of each turn.
+        self.auto_continuation_scheduled = false;
         self.request_redraw();
     }
 
@@ -665,6 +1066,44 @@ impl ChatWidget {
         debug!("TurnDiffEvent: {unified_diff}");
     }
 
+    /// If all subagents have completed and nothing is running, enqueue a brief
+    /// user message asking the main agent to continue from the subagent results.
+    fn maybe_schedule_auto_continuation(&mut self) {
+        if self.auto_continuation_scheduled {
+            return;
+        }
+        if !self.subagent_states.is_empty() {
+            return;
+        }
+        if self.bottom_pane.is_task_running() {
+            return;
+        }
+
+        // Compose a compact follow-up prompt to resume the main thread.
+        let mut completed: usize = 0;
+        let mut failed: usize = 0;
+        for meta in self.agents.values() {
+            match meta.status {
+                Some(true) => completed += 1,
+                Some(false) => failed += 1,
+                None => {}
+            }
+        }
+
+        let summary_line = if completed + failed > 0 {
+            format!("Subagents completed: {completed} ok, {failed} failed.")
+        } else {
+            "Subagent run completed.".to_string()
+        };
+
+        let prompt = format!(
+            "{summary_line}\n\nPlease continue the main task using the results above. Summarize key outcomes and either finish the task or propose the next steps."
+        );
+
+        self.auto_continuation_scheduled = true;
+        self.submit_user_message(prompt.into());
+    }
+
     fn on_background_event(&mut self, message: String) {
         debug!("BackgroundEvent: {message}");
     }
@@ -674,6 +1113,47 @@ impl ChatWidget {
             self.retry_status_header = Some(self.current_status_header.clone());
         }
         self.set_status_header(message);
+    }
+
+    fn on_agent_event(&mut self, agent_event: AgentEvent) {
+        let agent_id = agent_event.agent_id.clone();
+        let event = *agent_event.event;
+
+        // Assign different colors to different agents for better visual distinction
+        let agent_colors = [
+            Color::Cyan,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+            Color::Magenta,
+            Color::Red,
+            Color::White,
+            Color::LightGreen,
+            Color::LightBlue,
+        ];
+
+        // Find consistent color assignment based on agent order
+        let agent_ids: Vec<String> = self.agents.keys().cloned().collect();
+        let agent_index = agent_ids
+            .iter()
+            .position(|id| id == &agent_id)
+            .unwrap_or(self.subagent_states.len());
+        let color = agent_colors
+            .get(agent_index % agent_colors.len())
+            .copied()
+            .unwrap_or(Color::Magenta);
+
+        let state = self
+            .subagent_states
+            .entry(agent_id.clone())
+            .or_insert_with(|| SubAgentState::new(color));
+        let _outputs = state.handle_event(event, &self.config);
+        // We intentionally do not add intermediate subagent output cells
+        // to the transcript to keep the UI compact; the footer shows a
+        // concise, colored status bar for the active subagent.
+        self.active_subagent = Some(agent_id);
+        self.refresh_footer_subagent();
+        self.request_redraw();
     }
 
     /// Periodic tick to commit at most one queued line to history with a small delay,
@@ -1014,6 +1494,7 @@ impl ChatWidget {
             retry_status_header: None,
             conversation_id: None,
             queued_user_messages: VecDeque::new(),
+            auto_continuation_scheduled: false,
             show_welcome_banner: true,
             suppress_session_configured_redraw: false,
             pending_notification: None,
@@ -1025,10 +1506,17 @@ impl ChatWidget {
             session_input_tokens: 0,
             session_output_tokens: 0,
             current_turn_input_tokens: 0,
+            agents: HashMap::new(),
+            subagent_states: HashMap::new(),
+            active_subagent: None,
         };
 
         // Initialize token display with config values
         instance.set_token_info(None);
+        // Initialize footer model label
+        instance
+            .bottom_pane
+            .set_current_model(instance.config.model.clone());
         instance
     }
 
@@ -1053,7 +1541,7 @@ impl ChatWidget {
         let codex_op_tx =
             spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
 
-        Self {
+        let mut instance = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
             codex_op_tx,
@@ -1086,6 +1574,7 @@ impl ChatWidget {
             retry_status_header: None,
             conversation_id: None,
             queued_user_messages: VecDeque::new(),
+            auto_continuation_scheduled: false,
             show_welcome_banner: true,
             suppress_session_configured_redraw: true,
             pending_notification: None,
@@ -1097,7 +1586,16 @@ impl ChatWidget {
             session_input_tokens: 0,
             session_output_tokens: 0,
             current_turn_input_tokens: 0,
-        }
+            agents: HashMap::new(),
+            subagent_states: HashMap::new(),
+            active_subagent: None,
+        };
+
+        // Initialize footer model label
+        instance
+            .bottom_pane
+            .set_current_model(instance.config.model.clone());
+        instance
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
@@ -1110,6 +1608,16 @@ impl ChatWidget {
 
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event {
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT) => {
+                // Show a compact overview of all agents.
+                self.render_agents_overview_card();
+                return;
+            }
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers,
@@ -1127,6 +1635,58 @@ impl ChatWidget {
             } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'v') => {
                 if let Ok((path, info)) = paste_image_to_temp_png() {
                     self.attach_image(path, info.width, info.height, info.encoded_format.label());
+                }
+                return;
+            }
+            // Quick agent navigation shortcuts - Ctrl+1, Ctrl+2, etc.
+            KeyEvent {
+                code: KeyCode::Char(c @ '1'..='9'),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(digit) = c.to_digit(10) {
+                    let agent_index = digit as usize - 1;
+                    let agent_ids: Vec<String> = self.agents.keys().cloned().collect();
+                    if let Some(agent_id) = agent_ids.get(agent_index) {
+                        // Switch to the selected agent
+                        self.active_subagent = Some(agent_id.clone());
+                        self.refresh_footer_subagent();
+                        self.request_redraw();
+                    }
+                }
+                return;
+            }
+            // Ctrl+0 to return to main agent (no active subagent)
+            KeyEvent {
+                code: KeyCode::Char('0'),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.active_subagent = None;
+                self.refresh_footer_subagent();
+                self.request_redraw();
+                return;
+            }
+            // Ctrl+H to show agent navigation help
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.add_agent_navigation_info();
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                ..
+            } if self.active_subagent.is_some() && self.is_normal_backtrack_mode() => {
+                if let Some(agent_id) = self.active_subagent.clone() {
+                    self.submit_op(Op::InterruptAgent { agent_id });
                 }
                 return;
             }
@@ -1172,6 +1732,87 @@ impl ChatWidget {
                 }
             }
         }
+    }
+
+    fn render_agents_overview_card(&mut self) {
+        let rows: Vec<history_cell::AgentOverviewEntry> = self
+            .agents
+            .iter()
+            .map(|(id, meta)| {
+                (
+                    id.clone(),
+                    meta.profile.clone(),
+                    meta.purpose.clone(),
+                    meta.status,
+                    meta.last_summary.clone(),
+                    meta.context_percent,
+                )
+            })
+            .collect();
+        let cell = history_cell::new_agents_overview(rows);
+        self.add_to_history(cell);
+        self.request_redraw();
+    }
+
+    fn open_agents_popup(&mut self) {
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for (id, meta) in self.agents.iter() {
+            let mut name = id.clone();
+            if let Some(p) = &meta.profile {
+                name.push_str(&format!(" [{p}]"));
+            }
+            let status = match meta.status {
+                None => "in progress",
+                Some(true) => "completed",
+                Some(false) => "failed",
+            };
+            let description = Some(format!("{} — {}", meta.purpose, status));
+            let id_for_action = id.clone();
+            let profile_for_action = meta.profile.clone();
+            let purpose_for_action = meta.purpose.clone();
+            let status_for_action = meta.status;
+            let summary_for_action = meta.last_summary.clone();
+            let context_for_action = meta.context_percent;
+            let transcript_for_action = meta.transcript.clone();
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                let view = history_cell::AgentCardView {
+                    agent_id: &id_for_action,
+                    profile: profile_for_action.as_deref(),
+                    purpose: &purpose_for_action,
+                    status: status_for_action,
+                    summary: summary_for_action.as_deref(),
+                    context_percent: context_for_action,
+                    transcript: &transcript_for_action,
+                };
+                let cell = history_cell::new_agent_detail_card(view);
+                tx.send(AppEvent::InsertHistoryCell(Box::new(cell)));
+            })];
+            items.push(SelectionItem {
+                name,
+                description,
+                is_current: false,
+                actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        if items.is_empty() {
+            // If no agents are tracked yet, just show a message card.
+            self.add_to_history(history_cell::new_warning_event(
+                "No spawned agents yet in this session.".to_string(),
+            ));
+            self.request_redraw();
+            return;
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Agents".to_string()),
+            subtitle: Some("Use ↑/↓ to navigate, Enter to show details".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
     }
 
     pub(crate) fn attach_image(
@@ -1279,6 +1920,15 @@ impl ChatWidget {
             }
             SlashCommand::Think => {
                 self.add_think_toggle_info();
+            }
+            SlashCommand::Orchestrator => {
+                self.add_orchestrator_toggle_info();
+            }
+            SlashCommand::Profiles => {
+                self.add_profiles_info();
+            }
+            SlashCommand::Agents => {
+                self.open_agents_popup();
             }
             #[cfg(debug_assertions)]
             SlashCommand::TestApproval => {
@@ -1546,6 +2196,7 @@ impl ChatWidget {
             EventMsg::GetHistoryEntryResponse(ev) => self.on_get_history_entry_response(ev),
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
+            EventMsg::AgentEvent(ev) => self.on_agent_event(ev),
             EventMsg::ShutdownComplete => self.on_shutdown_complete(),
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => self.on_turn_diff(unified_diff),
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
@@ -1565,6 +2216,134 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            // Orchestrator events
+            EventMsg::AgentSpawned(ev) => {
+                let agent_id = ev.agent_id.clone();
+                self.agents.insert(
+                    agent_id.clone(),
+                    AgentMeta {
+                        profile: ev.profile.clone(),
+                        purpose: ev.purpose.clone(),
+                        status: None,
+                        last_summary: None,
+                        transcript: Vec::new(),
+                        context_percent: None,
+                    },
+                );
+                let mut header_lines: Vec<Line<'static>> =
+                    vec![vec![format!("Agent {agent_id}").bold()].into()];
+                if let Some(profile) = ev.profile.clone()
+                    && !profile.trim().is_empty()
+                {
+                    header_lines.push(vec!["profile: ".dim(), profile.into()].into());
+                }
+                if !ev.purpose.trim().is_empty() {
+                    header_lines.push(vec!["purpose: ".dim(), ev.purpose.into()].into());
+                }
+
+                let header_cell = PlainHistoryCell::new(header_lines);
+                let decorated_header = {
+                    let state = self
+                        .subagent_states
+                        .entry(agent_id.clone())
+                        .or_insert_with(|| SubAgentState::new(Color::Magenta));
+                    state.decorate_header(SubAgentState::boxed(header_cell))
+                };
+                self.add_boxed_history(decorated_header);
+                self.active_subagent = Some(agent_id);
+                self.refresh_footer_subagent();
+                self.request_redraw();
+            }
+            EventMsg::AgentProgress(ev) => {
+                let agent_id = ev.agent_id.clone();
+                let trimmed = ev.message.trim();
+
+                if let Some(meta) = self.agents.get_mut(&agent_id) {
+                    if let Some(rest) = trimmed.strip_prefix("context left: ") {
+                        let percent_str = rest.trim().trim_end_matches('%');
+                        if let Ok(percent) = percent_str.parse::<u8>() {
+                            meta.context_percent = Some(percent);
+                        }
+                    } else if !trimmed.is_empty() {
+                        for line in trimmed.lines() {
+                            let line = line.trim_end();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            meta.transcript.push(line.to_string());
+                        }
+                        const MAX_LOG_LINES: usize = 40;
+                        if meta.transcript.len() > MAX_LOG_LINES {
+                            let overflow = meta.transcript.len() - MAX_LOG_LINES;
+                            meta.transcript.drain(0..overflow);
+                        }
+                    }
+
+                    // Do not append a new progress card for each update to avoid spam.
+                    // The footer shows current status + context percent; a single
+                    // completion card will be added on AgentCompleted.
+                } else {
+                    // If we haven't seen this agent yet, fall back to nothing to keep UI clean
+                }
+
+                {
+                    let state = self
+                        .subagent_states
+                        .entry(agent_id.clone())
+                        .or_insert_with(|| SubAgentState::new(Color::Magenta));
+                    if let Some(percent) = self
+                        .agents
+                        .get(&agent_id)
+                        .and_then(|meta| meta.context_percent)
+                    {
+                        state.set_context_percent(percent);
+                    }
+                    if !trimmed.is_empty() && !trimmed.starts_with("context left: ") {
+                        state.record_status(trimmed);
+                    }
+                }
+
+                self.active_subagent = Some(agent_id);
+                self.refresh_footer_subagent();
+                self.request_redraw();
+            }
+            EventMsg::AgentCompleted(ev) => {
+                let agent_id = ev.agent_id.clone();
+                if let Some(meta) = self.agents.get_mut(&agent_id) {
+                    meta.status = Some(ev.success);
+                    meta.last_summary = Some(ev.summary.clone());
+                }
+
+                let mut fallback = Some(ev.clone());
+                if let Some(mut state) = self.subagent_states.remove(&agent_id) {
+                    let mut cells = state.completion_cells(ev.success, ev.summary, &self.config);
+                    for cell in cells.drain(..) {
+                        self.add_boxed_history(cell);
+                    }
+                    fallback = None;
+                }
+
+                // Always add a single compact completion summary so users
+                // see the result without the intermediate noise.
+                if let Some(ev) = fallback {
+                    self.add_to_history(history_cell::new_agent_completed_event(ev, &self.config));
+                }
+
+                if self
+                    .active_subagent
+                    .as_ref()
+                    .is_some_and(|current| current == &agent_id)
+                {
+                    self.active_subagent = self.subagent_states.keys().next().cloned();
+                }
+                self.refresh_footer_subagent();
+                // If all subagents are done and we're idle, schedule a continuation turn.
+                self.maybe_schedule_auto_continuation();
+                self.request_redraw();
+            }
+            EventMsg::AgentSwitched(_) => {
+                // Placeholder: will be handled when multi-agent UI is implemented
+            }
         }
     }
 
@@ -1947,6 +2726,8 @@ impl ChatWidget {
     pub(crate) fn set_model(&mut self, model: &str) {
         self.session_header.set_model(model);
         self.config.model = model.to_string();
+        self.bottom_pane
+            .set_current_model(self.config.model.clone());
     }
 
     pub(crate) fn add_info_message(&mut self, message: String, hint: Option<String>) {
@@ -2078,6 +2859,140 @@ impl ChatWidget {
         self.add_info_message(info.to_string(), None);
     }
 
+    fn add_agent_navigation_info(&mut self) {
+        let total_agents = self.agents.len();
+        if total_agents == 0 {
+            return;
+        }
+
+        let mut info = "**Agent Navigation**\n\n".to_string();
+
+        for (index, agent_id) in self.agents.keys().take(9).enumerate() {
+            let num = index + 1;
+            if let Some(meta) = self.agents.get(agent_id) {
+                let purpose = if meta.purpose.trim().is_empty() {
+                    agent_id.clone()
+                } else {
+                    meta.purpose.clone()
+                };
+                info.push_str(&format!("**Ctrl+{num}**: {purpose}\n"));
+            }
+        }
+
+        if total_agents > 9 {
+            info.push_str(&format!(
+                "... and {} more (use **Alt+A** to see all)\n",
+                total_agents - 9
+            ));
+        }
+
+        info.push_str("\n**Ctrl+0**: Return to main agent\n");
+        info.push_str("**Alt+A**: Show all agents overview");
+
+        self.add_info_message(info, None);
+    }
+
+    fn add_orchestrator_toggle_info(&mut self) {
+        let has_orchestrator_config = self.config.active_orchestrator_profile.is_some()
+            && !self.config.active_agent_profiles.is_empty();
+
+        let status = if has_orchestrator_config {
+            let orch_profile = self
+                .config
+                .active_orchestrator_profile
+                .as_deref()
+                .unwrap_or("unknown");
+            let agent_profiles = self.config.active_agent_profiles.join("`, `");
+            format!(
+                "**Status:** ✓ Configured\n\
+                    - Orchestrator profile: `{orch_profile}`\n\
+                    - Agent profiles: `{agent_profiles}`\n\n\
+                    The orchestrator infrastructure is ready. When you ask the agent to break down\n\
+                    complex tasks, it can coordinate multiple child agents automatically."
+            )
+        } else {
+            "**Status:** ⚠ Not Configured\n\n\
+            To enable orchestrator mode, add to `~/.codex-local/config.toml`:\n\n\
+            ```toml\n\
+            [profiles.orchestrator]\n\
+            model = \"claude-sonnet-4\"\n\n\
+            [profiles.worker]\n\
+            model = \"claude-haiku-3-5\"\n\n\
+            orchestrator_profile = \"orchestrator\"\n\
+            agent_profiles = [\"worker\"]\n\
+            ```"
+            .to_string()
+        };
+
+        let info = format!(
+            "**Multi-Agent Orchestrator Mode**\n\n\
+                    This feature allows the main agent to coordinate multiple child agents, \
+                    each working on separate subtasks in parallel.\n\n\
+                    {status}\n\n\
+                    **How it works:**\n\
+                    - Main agent identifies subtasks that can be parallelized\n\
+                    - Spawns child agents with isolated contexts\n\
+                    - Each child works independently on its assigned task\n\
+                    - Results are aggregated and validated via checklists\n\
+                    - Protocol events show progress of all agents"
+        );
+
+        self.add_info_message(info, None);
+    }
+
+    fn add_profiles_info(&mut self) {
+        let config_path = self.config.codex_home.join("config.toml");
+        let config_path_str = config_path.to_string_lossy();
+
+        let current_profile = self.config.active_profile.as_deref().unwrap_or("(default)");
+        let orch_profile = self
+            .config
+            .active_orchestrator_profile
+            .as_deref()
+            .unwrap_or("(none)");
+        let agent_profiles = if self.config.active_agent_profiles.is_empty() {
+            "(none)".to_string()
+        } else {
+            self.config.active_agent_profiles.join(", ")
+        };
+
+        let current_model = &self.config.model;
+        let current_provider = &self.config.model_provider_id;
+
+        let info = format!(
+            "**Configuration Profiles**\n\n\
+                    **Current Active Settings:**\n\
+                    - Main profile: `{current_profile}`\n\
+                    - Model: `{current_model}`\n\
+                    - Provider: `{current_provider}`\n\
+                    - Orchestrator profile: `{orch_profile}`\n\
+                    - Agent profiles: `{agent_profiles}`\n\n\
+                    **To edit profiles:** Run `codex-local profiles edit`\n\
+                    This will open `{config_path_str}` in your editor.\n\n\
+                    **Example profile configuration:**\n\
+                    ```toml\n\
+                    # Main profile for general work\n\
+                    [profiles.default]\n\
+                    model = \"claude-sonnet-4\"\n\n\
+                    # Fast profile for quick tasks\n\
+                    [profiles.fast]\n\
+                    model = \"claude-haiku-3-5\"\n\n\
+                    # Orchestrator configuration\n\
+                    [profiles.orchestrator]\n\
+                    model = \"claude-sonnet-4\"\n\n\
+                    [profiles.worker]\n\
+                    model = \"claude-haiku-3-5\"\n\n\
+                    # Activate profiles\n\
+                    profile = \"default\"\n\
+                    orchestrator_profile = \"orchestrator\"\n\
+                    agent_profiles = [\"worker\"]\n\
+                    ```\n\n\
+                    **Note:** After editing config.toml, restart codex-local to apply changes."
+        );
+
+        self.add_info_message(info, None);
+    }
+
     /// Forward file-search results to the bottom pane.
     pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
         self.bottom_pane.on_file_search_result(query, matches);
@@ -2086,6 +3001,17 @@ impl ChatWidget {
     /// Handle Ctrl-C key press.
     fn on_ctrl_c(&mut self) {
         if self.bottom_pane.on_ctrl_c() == CancellationEvent::Handled {
+            return;
+        }
+
+        if let Some(agent_id) = self
+            .active_subagent
+            .as_ref()
+            .cloned()
+            .filter(|_| !self.bottom_pane.is_task_running())
+        {
+            self.bottom_pane.show_ctrl_c_quit_hint();
+            self.submit_op(Op::InterruptAgent { agent_id });
             return;
         }
 

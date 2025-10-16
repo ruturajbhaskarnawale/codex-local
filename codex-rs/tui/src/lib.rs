@@ -29,6 +29,7 @@ use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
+mod agent_view;
 mod app;
 mod app_backtrack;
 mod app_event;
@@ -149,6 +150,7 @@ pub async fn run_main(
         include_view_image_tool: None,
         show_raw_agent_reasoning: cli.oss.then_some(true),
         tools_web_search_request: cli.web_search.then_some(true),
+        model_reasoning_effort: None,
     };
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
     let enable_mcp = cli.config_overrides.enable_mcp.clone();
